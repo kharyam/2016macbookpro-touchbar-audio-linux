@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""
+touchbar-daemon — mode-switching daemon for T1 Touch Bar.
+
+Behavior:
+  * Resting state: T1 in mode 2 (media glyphs on OLED). F-keys produced by
+    the Touch Bar are translated to media keycodes (brightness, volume, etc.).
+  * Tap the Fn key (bottom-left of main keyboard): toggles between media
+    mode and fn mode (mode 1 = Esc + F1-F12 with F-key glyphs).
+  * Double-tap Fn or long-press Fn (>700ms): force back to media mode.
+  * Fn held while another key is pressed: treated as a hardware modifier
+    (e.g. Fn+Left = Home on macOS); does NOT trigger a mode toggle.
+
+Signals:
+  * SIGUSR1: re-initialize (re-find devices, re-grab, re-send mode).
+    Triggered by the resume service after wake from suspend.
+  * SIGTERM / SIGINT: clean shutdown.
+
+Requires:
+  python3-evdev, python3-pyusb. Must run as root.
+"""
+from __future__ import annotations
+
+import os
+import select
+import signal
+import sys
+import time
+from typing import Optional
+
+try:
+    import usb.core
+except ImportError:
+    sys.exit("Missing dependency: python3-pyusb")
+
+try:
+    from evdev import InputDevice, UInput, ecodes, list_devices
+except ImportError:
+    sys.exit("Missing dependency: python3-evdev")
+
+
+# ---- iBridge USB constants ----
+VENDOR_ID = 0x05ac
+PRODUCT_ID = 0x8600
+TARGET_INTERFACE = 1
+
+# ---- Touch Bar modes ----
+MODE_FN = 1     # Esc + F1-F12 glyphs
+MODE_MEDIA = 2  # Esc + media glyphs (brightness, kbd backlight, media, volume)
+
+# ---- Fn key timing ----
+TAP_MAX_MS = 300          # held shorter than this and clean = tap
+LONGPRESS_MIN_MS = 700    # held longer than this = long press
+DOUBLETAP_WINDOW_MS = 400 # second tap within this window = double tap
+
+# ---- F-key to media-key translation (in MODE_MEDIA) ----
+# Empirically determined from the OLED glyph layout that mode 2 displays.
+# Position-by-position left-to-right after Esc: brightness ↓/↑, kbd
+# brightness ↓/↑, rewind, play/pause, fast forward, mute, vol ↓/↑.
+# The T1 firmware skips F3/F4 in mode 2; the gap is visible on the OLED.
+MEDIA_MAP = {
+    ecodes.KEY_F1:  ecodes.KEY_BRIGHTNESSDOWN,
+    ecodes.KEY_F2:  ecodes.KEY_BRIGHTNESSUP,
+    ecodes.KEY_F5:  ecodes.KEY_KBDILLUMDOWN,
+    ecodes.KEY_F6:  ecodes.KEY_KBDILLUMUP,
+    ecodes.KEY_F7:  ecodes.KEY_PREVIOUSSONG,
+    ecodes.KEY_F8:  ecodes.KEY_PLAYPAUSE,
+    ecodes.KEY_F9:  ecodes.KEY_NEXTSONG,
+    ecodes.KEY_F10: ecodes.KEY_MUTE,
+    ecodes.KEY_F11: ecodes.KEY_VOLUMEDOWN,
+    ecodes.KEY_F12: ecodes.KEY_VOLUMEUP,
+}
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def now_ms() -> float:
+    return time.monotonic() * 1000
+
+
+def find_input(name_substring: str) -> Optional[InputDevice]:
+    """Find an evdev input device by substring of its Name."""
+    for path in list_devices():
+        try:
+            d = InputDevice(path)
+            if name_substring in d.name:
+                return d
+        except Exception:
+            pass
+    return None
+
+
+def send_t1_mode(usb_dev, mode: int) -> None:
+    """
+    Send mode-change control transfers to the T1 iBridge.
+    Brute-forces all six (report_type, report_id) combinations on
+    interface 1; one of them is the right one for any given unit.
+    Also sends display-on commands so the OLED actually lights.
+    """
+    detached = []
+    try:
+        for intf in usb_dev.get_active_configuration():
+            n = intf.bInterfaceNumber
+            try:
+                if usb_dev.is_kernel_driver_active(n):
+                    usb_dev.detach_kernel_driver(n)
+                    detached.append(n)
+            except Exception:
+                pass
+
+        # Mode command (vendor, out, recipient=device)
+        for rt in (0x02, 0x03):
+            for ri in (0, 1, 2):
+                try:
+                    usb_dev.ctrl_transfer(0x40, 0x09, (rt << 8) | ri,
+                                          TARGET_INTERFACE,
+                                          bytes([mode]), 1000)
+                except Exception:
+                    pass
+
+        # Display ON (class, out, recipient=interface)
+        for ri in (0, 1, 2):
+            try:
+                usb_dev.ctrl_transfer(0x21, 0x09, (0x03 << 8) | ri,
+                                      TARGET_INTERFACE,
+                                      bytes([ri, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+                                      1000)
+            except Exception:
+                pass
+    finally:
+        for n in detached:
+            try:
+                usb_dev.attach_kernel_driver(n)
+            except Exception:
+                pass
+
+
+class Daemon:
+    def __init__(self) -> None:
+        self.usb_dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+        if not self.usb_dev:
+            sys.exit("iBridge USB device (05ac:8600) not found")
+
+        self.touchbar: Optional[InputDevice] = None
+        self.keyboard: Optional[InputDevice] = None
+        self.ui: Optional[UInput] = None
+        self.mode: Optional[int] = None
+
+        # Fn key state
+        self.fn_down = False
+        self.fn_down_time = 0.0
+        self.fn_modifier_used = False
+        self.last_tap_time = 0.0
+
+        # Flags set by signals
+        self.reinit_requested = False
+        self.shutdown_requested = False
+
+    def open_devices(self) -> None:
+        self.touchbar = find_input("iBridge")
+        if not self.touchbar:
+            raise RuntimeError("iBridge keyboard input device not found")
+        self.keyboard = find_input("SPI Keyboard")
+        if not self.keyboard:
+            raise RuntimeError("Apple SPI Keyboard not found")
+        log(f"Touch Bar: {self.touchbar.path} ({self.touchbar.name})")
+        log(f"Main kbd:  {self.keyboard.path} ({self.keyboard.name})")
+
+    def setup_uinput(self) -> None:
+        caps = {ecodes.EV_KEY: sorted(set([
+            ecodes.KEY_ESC,
+            *(ecodes.KEY_F1 + i for i in range(12)),
+            *MEDIA_MAP.values(),
+        ]))}
+        self.ui = UInput(caps, name="touchbar-virtual")
+        log("Virtual keyboard: touchbar-virtual")
+
+    def grab_touchbar(self) -> None:
+        try:
+            self.touchbar.grab()
+            log("Touch Bar grabbed (exclusive)")
+        except Exception as e:
+            log(f"Grab failed: {e}")
+
+    def regrab_touchbar(self) -> None:
+        """After USB driver detach/reattach or resume, the input device
+        may have been re-created. Re-find by name and re-grab."""
+        try:
+            self.touchbar.ungrab()
+        except Exception:
+            pass
+        try:
+            self.touchbar.close()
+        except Exception:
+            pass
+
+        time.sleep(0.3)
+        for _ in range(15):
+            self.touchbar = find_input("iBridge")
+            if self.touchbar:
+                break
+            time.sleep(0.1)
+        if not self.touchbar:
+            log("WARN: lost touchbar input device")
+            return
+        try:
+            self.touchbar.grab()
+        except Exception as e:
+            log(f"Re-grab failed: {e}")
+
+    def set_mode(self, mode: int, force: bool = False) -> None:
+        if not force and mode == self.mode:
+            return
+        log(f"Mode: {self.mode} -> {mode}")
+        send_t1_mode(self.usb_dev, mode)
+        self.mode = mode
+        self.regrab_touchbar()
+
+    # ----- event handlers -----
+
+    def handle_touchbar_event(self, ev) -> None:
+        if ev.type != ecodes.EV_KEY:
+            return
+        if self.mode == MODE_MEDIA and ev.code in MEDIA_MAP:
+            self.ui.write(ecodes.EV_KEY, MEDIA_MAP[ev.code], ev.value)
+        else:
+            self.ui.write(ecodes.EV_KEY, ev.code, ev.value)
+        self.ui.syn()
+
+    def handle_keyboard_event(self, ev) -> None:
+        if ev.type != ecodes.EV_KEY:
+            return
+
+        # Any non-Fn key going down while Fn is held = Fn was used as modifier
+        if ev.code != ecodes.KEY_FN:
+            if self.fn_down and ev.value == 1:
+                self.fn_modifier_used = True
+            return
+
+        # ev.code == KEY_FN
+        if ev.value == 1:
+            self.fn_down = True
+            self.fn_down_time = now_ms()
+            self.fn_modifier_used = False
+            return
+
+        if ev.value == 0 and self.fn_down:
+            self.fn_down = False
+            duration = now_ms() - self.fn_down_time
+
+            if self.fn_modifier_used:
+                return
+
+            if duration >= LONGPRESS_MIN_MS:
+                log("Long-press -> media")
+                self.set_mode(MODE_MEDIA)
+                self.last_tap_time = 0
+                return
+
+            if duration <= TAP_MAX_MS:
+                t = now_ms()
+                if t - self.last_tap_time <= DOUBLETAP_WINDOW_MS:
+                    log("Double-tap -> media")
+                    self.set_mode(MODE_MEDIA)
+                    self.last_tap_time = 0
+                else:
+                    new_mode = MODE_FN if self.mode == MODE_MEDIA else MODE_MEDIA
+                    log(f"Tap -> {'fn' if new_mode == MODE_FN else 'media'}")
+                    self.set_mode(new_mode)
+                    self.last_tap_time = t
+
+    # ----- signal handlers -----
+
+    def request_reinit(self, *_) -> None:
+        self.reinit_requested = True
+
+    def request_shutdown(self, *_) -> None:
+        self.shutdown_requested = True
+
+    # ----- main loop -----
+
+    def reinit(self) -> None:
+        log("Re-initializing (resume from suspend?)")
+        prev_mode = self.mode or MODE_MEDIA
+        self.regrab_touchbar()
+        self.set_mode(prev_mode, force=True)
+
+    def run(self) -> None:
+        signal.signal(signal.SIGTERM, self.request_shutdown)
+        signal.signal(signal.SIGINT, self.request_shutdown)
+        signal.signal(signal.SIGUSR1, self.request_reinit)
+
+        self.open_devices()
+        self.setup_uinput()
+        self.grab_touchbar()
+        self.set_mode(MODE_MEDIA)
+        log("Daemon ready. Default: media.")
+
+        try:
+            while not self.shutdown_requested:
+                if self.reinit_requested:
+                    self.reinit_requested = False
+                    self.reinit()
+
+                fds = []
+                if self.touchbar:
+                    fds.append(self.touchbar.fd)
+                fds.append(self.keyboard.fd)
+
+                try:
+                    r, _, _ = select.select(fds, [], [], 1.0)
+                except (OSError, ValueError, InterruptedError):
+                    continue
+
+                if self.touchbar and self.touchbar.fd in r:
+                    try:
+                        for ev in self.touchbar.read():
+                            self.handle_touchbar_event(ev)
+                    except (BlockingIOError, OSError) as e:
+                        log(f"Touch Bar read error: {e}; re-grabbing")
+                        self.regrab_touchbar()
+
+                if self.keyboard.fd in r:
+                    try:
+                        for ev in self.keyboard.read():
+                            self.handle_keyboard_event(ev)
+                    except (BlockingIOError, OSError) as e:
+                        log(f"Keyboard read error: {e}")
+                        time.sleep(0.5)
+        finally:
+            log("Shutting down")
+            try:
+                self.ui.close()
+            except Exception:
+                pass
+            try:
+                self.touchbar.ungrab()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("Must run as root.")
+    Daemon().run()

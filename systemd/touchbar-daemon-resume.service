@@ -1,0 +1,14 @@
+[Unit]
+Description=Tell touchbar-daemon to re-initialize after resume
+Documentation=https://github.com/YOUR-USERNAME/mbp-t1-touchbar-linux
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 1
+# SIGUSR1 makes the daemon re-find input devices and re-send the mode command,
+# which the T1 sometimes forgets across suspend.
+ExecStart=/bin/sh -c '/usr/bin/pkill -USR1 -f /usr/local/bin/touchbar-daemon || true'
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=T1 Touch Bar mode-switching daemon
+Documentation=https://github.com/YOUR-USERNAME/mbp-t1-touchbar-linux
+After=multi-user.target
+# Conflict with the simpler wake services so they don't fight over the device
+Conflicts=touchbar-wake.service touchbar-resume.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/touchbar-daemon
+Restart=on-failure
+RestartSec=2s
+# Daemon writes its log lines via stdout/stderr; systemd captures them
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
