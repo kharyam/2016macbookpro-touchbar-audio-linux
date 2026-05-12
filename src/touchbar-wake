@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+touchbar-wake — wake the T1 Touch Bar on 2016/2017 MacBook Pros.
+
+The T1 iBridge enumerates as USB device 05ac:8600. It comes up but doesn't
+do anything visible until it receives two HID Set_Report control transfers:
+one to set the mode (Esc + Fn keys), one to turn the OLED on.
+
+We don't know in advance which (report_type, report_id) combination the
+specific T1 firmware in a given MacBook Pro accepts — it varies between
+units. So we send all six plausible combinations to interface 1. The wrong
+ones are silently rejected, the right one wakes the chip. Total runtime is
+on the order of milliseconds.
+
+This script is idempotent. Run it as many times as you want.
+
+Requires: python3-pyusb (Debian/Ubuntu), python3-pyusb (Fedora), python-pyusb (Arch).
+Must be run as root (the USB control endpoint requires it).
+"""
+
+import sys
+
+try:
+    import usb.core
+except ImportError:
+    print("pyusb not installed. Install with:", file=sys.stderr)
+    print("  Fedora:  sudo dnf install python3-pyusb", file=sys.stderr)
+    print("  Debian:  sudo apt install python3-usb", file=sys.stderr)
+    print("  Arch:    sudo pacman -S python-pyusb", file=sys.stderr)
+    sys.exit(1)
+
+
+# Apple iBridge T1
+VENDOR_ID = 0x05ac
+PRODUCT_ID = 0x8600
+
+# USB control transfer types
+HID_SET_REPORT = 0x09
+
+# bmRequestType for the mode command (vendor request, out, device)
+MODE_REQUEST_TYPE = 0x40
+
+# bmRequestType for the display command (class request, out, interface)
+DISPLAY_REQUEST_TYPE = 0x21
+
+# Touch Bar modes (from the original kernel driver reverse engineering)
+MODE_ESC_ONLY = 0
+MODE_ESC_FN = 1
+MODE_ESC_SPECIAL = 2
+MODE_OFF = 3
+
+# Display states
+DISPLAY_OFF = 0
+DISPLAY_ON = 1
+DISPLAY_DIM = 2
+
+# The interface that accepts our control transfers. Determined empirically
+# on MacBookPro13,3 — interface 1 was the one that worked. If you have a
+# different unit and this doesn't work, the diagnostic script in this repo
+# can find the right one.
+TARGET_INTERFACE = 1
+
+
+def main() -> int:
+    dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+    if dev is None:
+        print(f"iBridge USB device ({VENDOR_ID:04x}:{PRODUCT_ID:04x}) not found.",
+              file=sys.stderr)
+        print("Is this a 2016/2017 MacBook Pro with a Touch Bar?",
+              file=sys.stderr)
+        return 1
+
+    # We need to detach hid-generic from the interfaces it's claimed,
+    # otherwise libusb refuses to send control transfers. Track which we
+    # detached so we can reattach them at the end and leave the system as
+    # we found it.
+    detached_interfaces = []
+    try:
+        config = dev.get_active_configuration()
+    except usb.core.USBError as e:
+        print(f"Could not read active USB configuration: {e}", file=sys.stderr)
+        return 1
+
+    for interface in config:
+        ifnum = interface.bInterfaceNumber
+        try:
+            if dev.is_kernel_driver_active(ifnum):
+                dev.detach_kernel_driver(ifnum)
+                detached_interfaces.append(ifnum)
+        except usb.core.USBError:
+            # Some interfaces (e.g. the display data interface) don't have a
+            # kernel driver bound and that's fine.
+            pass
+
+    try:
+        send_mode_command(dev, MODE_ESC_FN)
+        send_display_command(dev, DISPLAY_ON)
+    finally:
+        # Always reattach kernel drivers so the system input pipeline keeps
+        # working after we exit.
+        for ifnum in detached_interfaces:
+            try:
+                dev.attach_kernel_driver(ifnum)
+            except usb.core.USBError:
+                pass
+
+    print("Touch Bar wake sequence sent.")
+    return 0
+
+
+def send_mode_command(dev: "usb.core.Device", mode: int) -> None:
+    """
+    Send a single-byte mode command, trying all six plausible
+    (report_type, report_id) combinations. Wrong combinations are silently
+    rejected by the device.
+    """
+    payload = bytes([mode])
+    for report_type in (0x02, 0x03):  # 0x02 = Output, 0x03 = Feature
+        for report_id in (0, 1, 2):
+            w_value = (report_type << 8) | report_id
+            try:
+                dev.ctrl_transfer(
+                    bmRequestType=MODE_REQUEST_TYPE,
+                    bRequest=HID_SET_REPORT,
+                    wValue=w_value,
+                    wIndex=TARGET_INTERFACE,
+                    data_or_wLength=payload,
+                    timeout=1000,
+                )
+            except usb.core.USBError:
+                # Wrong report ID — try the next combination.
+                pass
+
+
+def send_display_command(dev: "usb.core.Device", state: int) -> None:
+    """
+    Send the 11-byte display feature report telling the OLED to turn on,
+    dim, or off. Again we try all three plausible report IDs.
+    """
+    for report_id in (0, 1, 2):
+        report = bytes([report_id, 1, state, 0, 0, 0, 0, 0, 0, 0, 0])
+        w_value = (0x03 << 8) | report_id  # Feature report
+        try:
+            dev.ctrl_transfer(
+                bmRequestType=DISPLAY_REQUEST_TYPE,
+                bRequest=HID_SET_REPORT,
+                wValue=w_value,
+                wIndex=TARGET_INTERFACE,
+                data_or_wLength=report,
+                timeout=1000,
+            )
+        except usb.core.USBError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

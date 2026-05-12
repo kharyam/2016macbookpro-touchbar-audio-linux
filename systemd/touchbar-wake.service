@@ -1,0 +1,16 @@
+[Unit]
+Description=Wake T1 Touch Bar on 2016/2017 MacBook Pro
+Documentation=https://github.com/YOUR-USERNAME/mbp-t1-touchbar-linux
+After=systemd-user-sessions.service multi-user.target
+
+[Service]
+Type=oneshot
+# Brief delay to ensure USB enumeration is complete before we poke the device.
+# Three seconds is empirical on a 2016 MBP; reduce if your hardware enumerates
+# faster, increase if you sometimes see "iBridge USB device not found".
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/touchbar-wake
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

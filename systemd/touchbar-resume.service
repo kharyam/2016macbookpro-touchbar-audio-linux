@@ -1,0 +1,14 @@
+[Unit]
+Description=Wake T1 Touch Bar after resume from suspend/hibernate
+Documentation=https://github.com/YOUR-USERNAME/mbp-t1-touchbar-linux
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+# Small delay to give the USB subsystem a moment to come back up before we
+# try to talk to the iBridge.
+ExecStartPre=/bin/sleep 1
+ExecStart=/usr/local/bin/touchbar-wake
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
