@@ -139,6 +139,38 @@ else
 fi
 log "Services enabled."
 
+# --- input grabber conflict detection ---
+#
+# Daemon mode grabs the iBridge keyboard exclusively. If another input
+# remapper (keyd is by far the most common) is already grabbing it, our
+# grab fails with EBUSY. Auto-configure keyd to ignore the iBridge.
+
+if [ "$INSTALL_MODE" = "daemon" ]; then
+    hdr "Checking for input grabber conflicts"
+
+    if systemctl is-enabled keyd.service >/dev/null 2>&1 || \
+       systemctl is-active keyd.service >/dev/null 2>&1; then
+        log "keyd detected — adding iBridge exclusion."
+
+        if [ -d /etc/keyd ]; then
+            cat > /etc/keyd/00-ignore-ibridge.conf <<'EOF'
+# Exclude the Apple iBridge (Touch Bar) from keyd grabs.
+# The touchbar-daemon needs exclusive access to translate F-keys to media keys.
+[ids]
+-05ac:8600
+EOF
+            log "/etc/keyd/00-ignore-ibridge.conf"
+            systemctl restart keyd.service 2>/dev/null || true
+            log "Restarted keyd."
+        else
+            warn "keyd is installed but /etc/keyd doesn't exist; skipping config."
+        fi
+    fi
+
+    # Hook for future detection of other input remappers (kanata,
+    # interception-tools, xkeysnail, etc.) — open an issue if you use one.
+fi
+
 hdr "Starting now"
 if [ "$INSTALL_MODE" = "simple" ]; then
     /usr/local/bin/touchbar-wake || warn "Wake command exited non-zero."

@@ -33,13 +33,21 @@ for f in \
     /etc/systemd/system/touchbar-wake.service \
     /etc/systemd/system/touchbar-resume.service \
     /etc/systemd/system/touchbar-daemon.service \
-    /etc/systemd/system/touchbar-daemon-resume.service
+    /etc/systemd/system/touchbar-daemon-resume.service \
+    /etc/keyd/00-ignore-ibridge.conf
 do
     if [ -e "$f" ]; then
         rm -f "$f"
         log "Removed $f"
     fi
 done
+
+# If we removed the keyd exclusion, restart keyd so it picks up the
+# change (otherwise it'll keep the iBridge ungrabbed until next reload).
+if systemctl is-active keyd.service >/dev/null 2>&1; then
+    systemctl restart keyd.service 2>/dev/null || true
+    log "Restarted keyd."
+fi
 
 systemctl daemon-reload
 

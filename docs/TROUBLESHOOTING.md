@@ -61,10 +61,37 @@ journalctl -u touchbar-daemon.service | grep -E '(grab|mode)'
 
 You should see `Touch Bar grabbed (exclusive)` and `Mode: None -> 2`.
 
-If grab failed, another process has the device. `keyd` and similar key
-remappers are the most common culprits — they grab input devices
-aggressively. Either disable that service or tell it to ignore the
-iBridge (each remapper has its own config syntax).
+If you see `Grab failed: [Errno 16] Device or resource busy`, jump to the
+keyd / input grabber section below.
+
+### keyd (or other input grabber) holds the iBridge
+
+This is the most common post-install issue. The daemon needs exclusive
+access to the iBridge keyboard so it can intercept and translate F-keys
+to media keys. If another process (almost always `keyd`, occasionally
+`kanata`, `interception-tools`, or `xkeysnail`) is already grabbing it,
+our grab fails with `[Errno 16] Device or resource busy`.
+
+The install script tries to detect keyd and auto-configure an exclusion.
+If you installed keyd *after* running `install.sh`, or if the auto-config
+didn't run for some reason, apply it manually:
+
+```bash
+sudo tee /etc/keyd/00-ignore-ibridge.conf > /dev/null <<'EOF'
+[ids]
+-05ac:8600
+EOF
+sudo systemctl restart keyd
+sudo systemctl restart touchbar-daemon.service
+journalctl -u touchbar-daemon.service -n 10
+```
+
+You should now see `Touch Bar grabbed (exclusive)` in the journal.
+
+For other input remappers, the principle is the same: tell them to
+exclude USB device `05ac:8600`. Consult that tool's docs for the
+specific syntax. An open issue if your remapper isn't supported by
+this exclusion logic and we'll add detection for it.
 
 ### Tapping a glyph fires the wrong action
 

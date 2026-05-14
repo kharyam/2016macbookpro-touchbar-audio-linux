@@ -183,6 +183,10 @@ class Daemon:
             log("Touch Bar grabbed (exclusive)")
         except Exception as e:
             log(f"Grab failed: {e}")
+            if "busy" in str(e).lower():
+                log("  Another process has the iBridge grabbed exclusively.")
+                log("  Likely culprit: keyd or another input remapper.")
+                log("  See docs/TROUBLESHOOTING.md (keyd section).")
 
     def regrab_touchbar(self) -> None:
         """After USB driver detach/reattach or resume, the input device
@@ -209,6 +213,9 @@ class Daemon:
             self.touchbar.grab()
         except Exception as e:
             log(f"Re-grab failed: {e}")
+            if "busy" in str(e).lower():
+                log("  Another process has the iBridge grabbed exclusively.")
+                log("  See docs/TROUBLESHOOTING.md (keyd section).")
 
     def set_mode(self, mode: int, force: bool = False) -> None:
         if not force and mode == self.mode:
